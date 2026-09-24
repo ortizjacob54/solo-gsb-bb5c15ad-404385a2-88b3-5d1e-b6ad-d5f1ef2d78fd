@@ -198,3 +198,47 @@ class OffsetDiagnosticsResponse(BaseModel):
             "跨零点的最优集合在 [0,cycle) 内分段表示"
         ),
     )
+
+
+class SlotOffsetsRequest(GreenWaveRequest):
+    """整段时隙可调 offset 请求：在绿波请求基础上指定唯一可调路口下标。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    adjustable_index: int = Field(
+        ..., ge=0, description="唯一允许调整 offset 的路口下标，从 0 起，须小于路口数"
+    )
+
+    def validate_ranges(self) -> None:
+        """复用全部绿波 422 校验，并额外校验可调路口下标范围。"""
+        super().validate_ranges()
+        if self.adjustable_index >= len(self.intersections):
+            raise HTTPException(
+                status_code=422,
+                detail=[
+                    "adjustable_index 必须满足 0 <= adjustable_index < 路口数"
+                ],
+            )
+
+
+class SlotOffsetsResponse(BaseModel):
+    """整段时隙可调 offset 结果：可行 offset 区间与距原值环形最近的建议值。"""
+
+    adjustable_index: int = Field(
+        ..., ge=0, description="请求中指定的可调路口下标"
+    )
+    feasible_intervals: list[OffsetInterval] = Field(
+        ...,
+        description=(
+            "使发车范围内每个整数秒都能在所有路口遇绿的全部极大半开整数 "
+            "offset 区间 [start,end)（0 <= start < end <= cycle），按起点升序；"
+            "跨零点的可行集合在 [0,cycle) 内分段表示；无可行值时为空数组"
+        ),
+    )
+    recommended_offset: int | None = Field(
+        ...,
+        description=(
+            "距该路口原 offset 环形距离最小的可行整数 offset；正反向等距时取"
+            "较小者；无可行值时为 null"
+        ),
+    )

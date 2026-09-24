@@ -37,6 +37,25 @@
 ``a`` 处 +1、``b`` 处 -1 的差分事件，按位置排序后逐段扫描即可，不逐秒统计。
 取全局最大覆盖数，合并相邻（端点相接）的最优段，即得全部极大半开发车区间；
 最大值为 0 时没有任何事件，唯一的极大区间即完整发车范围。
+
+整段时隙可调 offset
+--------------------
+:func:`compute_slot_offsets` 要求发车范围 ``[depart_from, depart_to)`` 内
+**每个整数秒**都能发车（其余路口保持原 offset），求唯一可调路口的全部可行
+整数 ``offset ∈ [0, C)``。
+
+固定路口直接复用单路口可行窗口：覆盖全部整数秒当且仅当合并后窗口恰为完整
+发车范围（半开区间之间任何正长度间隙都至少漏掉一个整数秒）。
+
+可调路口仍受自身行驶波动 ``[T, T_max]`` 约束。波动收缩后的可行本地相位是
+周期圆上一条半开弧 E（跨零点绿灯先连续再收缩，常绿为整圆；弧长 L 即
+:func:`eroded_green_components` 给出的连续分量长度）。令 n 为发车范围秒数，
+``shift = (T + o) mod C``，范围内 n 个整数出发时刻对应的本地相位恰是圆上
+n 个连续点 ``[lo+shift, hi+shift) mod C``；它们整体落入弧 E，当且仅当
+``L >= n``，且 shift 可取一段长 ``M = L - n + 1`` 的连续闭整数弧（半开表示
+为 ``[r0, r0+M) mod C``，``r0 = (e0 - lo) mod C``）。offset 弧由其整体旋转
+``-T`` 得到，跨零点时在 ``[0, C)`` 内分两段。``L >= C``（整圆常绿）时每个
+offset 都可行；``L < n``（含 n >= C 而非常绿）时可行集为空。
 """
 
 from __future__ import annotations
@@ -426,3 +445,124 @@ def offset_diagnostics(
         else:
             optimal.append([start, end])
     return minimum, optimal
+
+
+# ---------- 整段时隙可调 offset ----------
+
+
+def _arc_intervals(start: int, length: int, cycle: int) -> list[Interval]:
+    """周期圆上自 start 起 length 个整数的连续弧，用 [0,C) 内半开区间表示。
+
+    length >= cycle 时整圆为 ``[[0, cycle]]``；跨零点时分两段，按起点升序
+    （``[0, tail]`` 在前、``[start, cycle]`` 在后）。
+    """
+    if length >= cycle:
+        return [[0, cycle]]
+    start %= cycle
+    tail = start + length
+    if tail <= cycle:
+        return [[start, tail]]
+    return [[0, tail - cycle], [start, cycle]]
+
+
+def _recommend_offset(
+    intervals: list[Interval], original: int, cycle: int
+) -> int:
+    """从可行 offset 区间（[0,C) 内有序半开区间，至多跨零点两段）中取建议值。
+
+    建议值为距 ``original`` 环形距离最小的可行整数 offset；正向（增大）与
+    反向（减小，绕零点）等距时取较小的 offset。``original`` 自身可行时
+    距离为 0，直接返回；否则只需比较环形正向最近点与环形反向最近点。
+    """
+    for start, end in intervals:
+        if start <= original < end:
+            return original
+
+    # 环形正向最近点：线性意义下第一个起点不小于 original 的段；没有则绕到
+    # 整圆上最小的可行点（首段起点）。
+    forward = next(
+        (start for start, end in intervals if start >= original),
+        intervals[0][0],
+    )
+    # 环形反向最近点：线性意义下最后一个整段位于 original 之前的段末点；
+    # 没有则绕到整圆上最大的可行点（末段终点 - 1）。
+    backward = next(
+        (end - 1 for start, end in reversed(intervals) if end - 1 <= original),
+        intervals[-1][1] - 1,
+    )
+
+    def ring_distance(value: int) -> int:
+        delta = (value - original) % cycle
+        return min(delta, cycle - delta)
+
+    candidates = [forward, backward]
+    return min(candidates, key=lambda value: (ring_distance(value), value))
+
+
+def compute_slot_offsets(
+    intersections: Iterable[dict],
+    depart_from: int,
+    depart_to: int,
+    adjustable_index: int,
+) -> tuple[list[Interval], int | None]:
+    """求唯一可调路口的全部可行整数 offset（整段时隙语义）及建议值。
+
+    要求发车范围 ``[depart_from, depart_to)`` 内**每个整数秒**出发，在各
+    路口任意实际行驶时间（``[T, T_max]`` 内任意实数）下都遇绿。除
+    ``intersections[adjustable_index]`` 外的路口保持请求中的原 offset；
+    可调路口的原 offset 仅用于给出环形距离最小的建议值，不参与可行性。
+
+    返回 ``(极大半开 offset 区间列表, 建议 offset)``：区间内每个整数
+    offset 均可行，按起点升序，跨零点的可行弧在 ``[0, cycle)`` 内分两段；
+    无任何可行 offset（含某个固定路口无法覆盖整段、可调路口收缩后绿灯
+    长度不足）时返回 ``([], None)``。
+    """
+    nodes = list(intersections)
+    for index, item in enumerate(nodes):
+        if index == adjustable_index:
+            continue
+        windows = departure_windows_for_intersection(
+            cycle=item["cycle"],
+            offset=item["offset"],
+            green_start=item["green_start"],
+            green_end=item["green_end"],
+            travel=item["travel"],
+            travel_max=item.get("travel_max"),
+            depart_from=depart_from,
+            depart_to=depart_to,
+        )
+        # 半开区间之间任何正长度间隙都会漏掉至少一个整数秒；覆盖全部整数秒
+        # 当且仅当合并结果恰为完整的 [depart_from, depart_to)。
+        if windows != [[depart_from, depart_to]]:
+            return [], None
+
+    target = nodes[adjustable_index]
+    cycle = target["cycle"]
+    travel_max = target.get("travel_max")
+    if travel_max is None:
+        travel_max = target["travel"]
+    slack = travel_max - target["travel"]
+    always_green, components = eroded_green_components(
+        cycle, target["green_start"], target["green_end"], slack
+    )
+    if always_green:
+        intervals = [[0, cycle]]
+    else:
+        # 跨零点绿灯在 eroded_green_components 中已先视为连续段再收缩，
+        # 这里至多得到一条分量 [e0, e0+L)（L 为收缩后半开长度，< C）。
+        span = depart_to - depart_from
+        if not components:
+            return [], None
+        e0, e1 = components[0]
+        feasible_count = (e1 - e0) - span + 1
+        if feasible_count <= 0:
+            return [], None
+        # 可行 shift 弧起点 r0 = (e0 - lo) mod C（hi 端点已计入 M = L-n+1）；
+        # offset = shift - T (mod C)。
+        origin = (e0 - depart_from - target["travel"]) % cycle
+        intervals = _arc_intervals(origin, feasible_count, cycle)
+
+    recommended = _recommend_offset(
+        intervals, target["offset"], cycle
+    )
+    return intervals, recommended
