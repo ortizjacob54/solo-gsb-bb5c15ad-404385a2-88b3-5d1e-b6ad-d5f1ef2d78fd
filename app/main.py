@@ -4,13 +4,20 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 
-from .greenwave import compute_max_coverage, compute_windows, offset_diagnostics
+from .greenwave import (
+    compute_max_coverage,
+    compute_slot_offsets,
+    compute_windows,
+    offset_diagnostics,
+)
 from .schemas import (
     GreenWaveRequest,
     MaxCoverageResponse,
     OffsetDiagnosticsRequest,
     OffsetDiagnosticsResponse,
     OffsetInterval,
+    SlotOffsetRequest,
+    SlotOffsetResponse,
     Window,
 )
 
@@ -30,9 +37,15 @@ app = FastAPI(
         "另有最大覆盖接口 `POST /api/green-wave/max-coverage`：对范围内每个"
         "出发时刻统计（任意行驶时长抵达都）遇绿的路口数，返回全局最大路口数"
         "及取到该值的全部极大半开发车区间（复用单路口可行窗口并按区间端点"
-        "扫描覆盖数，不逐秒统计）。"
+        "扫描覆盖数，不逐秒统计）。\n\n"
+        "另有可调路口 offset 寻优接口 `POST /api/green-wave/slot-offsets`："
+        "复用路口参数与发车范围，另传 adjustable_index 指定唯一可调路口，"
+        "要求 [depart_from,depart_to) 内每个整数秒都必须可发车；其余路口"
+        "保持原 offset（任一路口不能整段保证遇绿则可行集为空），返回可调"
+        "路口全部极大半开可行整数 offset 区间及距原 offset 环形距离最小的"
+        "建议值（等距取较小 offset，无可行值为 null）。"
     ),
-    version="1.2.0",
+    version="1.3.0",
 )
 
 
@@ -118,4 +131,29 @@ def green_wave_offset_diagnostics(
         optimal_intervals=[
             OffsetInterval(start=start, end=end) for start, end in intervals
         ],
+    )
+
+
+@app.post(
+    "/api/green-wave/slot-offsets",
+    response_model=SlotOffsetResponse,
+    tags=["绿波"],
+    summary="可调路口 offset 寻优：整段逐秒可发车的可行 offset 区间与建议值",
+)
+def green_wave_slot_offsets(request: SlotOffsetRequest) -> SlotOffsetResponse:
+    request.validate_ranges()
+    intervals, suggestion = compute_slot_offsets(
+        intersections=[
+            _intersection_payload(item) for item in request.intersections
+        ],
+        adjustable_index=request.adjustable_index,
+        depart_from=request.depart_from,
+        depart_to=request.depart_to,
+    )
+    return SlotOffsetResponse(
+        adjustable_index=request.adjustable_index,
+        feasible_intervals=[
+            OffsetInterval(start=start, end=end) for start, end in intervals
+        ],
+        suggested_offset=suggestion,
     )

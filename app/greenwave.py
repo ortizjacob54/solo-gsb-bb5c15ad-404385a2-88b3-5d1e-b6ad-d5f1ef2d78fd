@@ -37,6 +37,20 @@
 ``a`` 处 +1、``b`` 处 -1 的差分事件，按位置排序后逐段扫描即可，不逐秒统计。
 取全局最大覆盖数，合并相邻（端点相接）的最优段，即得全部极大半开发车区间；
 最大值为 0 时没有任何事件，唯一的极大区间即完整发车范围。
+
+可调路口 offset 寻优（slot-offsets）
+------------------------------------
+:func:`compute_slot_offsets` 中，除可调路口外的其余路口 offset 固定，它们的
+可行窗口（同样含波动收缩）必须**完整覆盖**整段半开发车范围
+``[depart_from, depart_to)``——窗口端点都是整数，覆盖范围内每个整数秒与连续
+覆盖该半开区间等价。
+
+对可调路口，令范围长度 ``L = depart_to - depart_from``。在已做行驶波动收缩
+（跨零点绿灯先视为连续段再收缩）的基础上再做**整段时隙收缩**：连续 L 个整数
+出发时刻都可行，当且仅当长度 L 的整数弧整体落入某个周期重复的收缩绿灯分量
+``[kC+a, kC+b)``，即起点相位被允许在长度 ``b-a-L`` 的余量区间内。跨零点绿灯
+经波动收缩后的分量可以长于一个周期，故余量区间也可能跨过零点；周期圆上旋转
+回 offset 后在 ``[0, C)`` 内分段表示，即得全部极大半开可行 offset 区间。
 """
 
 from __future__ import annotations
@@ -294,6 +308,33 @@ def compute_max_coverage(
 Observation = tuple[int, bool]  # (arrival_time, observed_green)
 
 
+def _rotate_intervals_on_circle(
+    intervals: list[Interval], cycle: int, shift: int
+) -> list[Interval]:
+    """把 ``[0, C)`` 内一组半开整数区间在周期圆上整体平移 ``-shift``。
+
+    平移保持长度与互不相交性：``[a, b)`` 平移后为长度不变的半开整数弧
+    ``[(a-shift) mod C, ...)``，绕零点时断成两段。输入区间已合并且总长度
+    不超过 C 时，输出经 :func:`merge_intervals` 合并相邻（端点相接）段后
+    仍为有序互不相交的半开区间列表；输入为完整周期 ``[[0, C]]`` 时原样返回。
+    """
+    if intervals == [[0, cycle]]:
+        return [[0, cycle]]
+    shift %= cycle
+    rotated: list[Interval] = []
+    for a, b in intervals:
+        length = b - a
+        lo = (a - shift) % cycle
+        if lo + length <= cycle:
+            rotated.append([lo, lo + length])
+        else:
+            rotated.append([lo, cycle])
+            tail = (lo + length) % cycle
+            if tail:
+                rotated.append([0, tail])
+    return merge_intervals(rotated)
+
+
 def _shifted_circle_intervals(
     cycle: int,
     green_start: int,
@@ -309,27 +350,15 @@ def _shifted_circle_intervals(
     """
     if green_start == green_end:
         return [[0, cycle]]
-    shift %= cycle
-    intervals: list[Interval] = []
     # 非跨零点绿灯 [gs, ge) 是一段；跨零点先视为连续段 [gs, C+ge)。
     raw = (
         [(green_start, green_end)]
         if green_start < green_end
         else [(green_start, cycle + green_end)]
     )
-    for a, b in raw:
-        lo = (a - shift) % cycle
-        hi = (b - shift) % cycle
-        length = b - a  # 非常绿段长度必小于 C，平移后至多绕零点一次
-        if lo < hi:
-            intervals.append([lo, hi])
-        else:
-            # 半开长度不变：从 lo 起 length 秒，跨零点则断成两段。
-            intervals.append([lo, min(cycle, lo + length)])
-            tail = (lo + length) % cycle
-            if tail:
-                intervals.append([0, tail])
-    return merge_intervals(intervals)
+    return _rotate_intervals_on_circle(
+        [[a, b] for a, b in raw], cycle, shift
+    )
 
 
 def _complement_in_cycle(intervals: list[Interval], cycle: int) -> list[Interval]:
@@ -426,3 +455,165 @@ def offset_diagnostics(
         else:
             optimal.append([start, end])
     return minimum, optimal
+
+
+# ---------- 可调路口 offset 寻优 ----------
+
+
+def _feasible_slot_offsets_for_intersection(
+    cycle: int,
+    green_start: int,
+    green_end: int,
+    travel: int,
+    travel_max: int,
+    depart_from: int,
+    depart_to: int,
+) -> list[Interval]:
+    """单个可调路口使整段每个整数秒都可发车的全部可行 offset（[0,C) 内）。
+
+    行驶时间可能取 ``[travel, travel_max]`` 内任意实数，发车范围
+    ``[depart_from, depart_to)`` 内**每个整数秒**都必须保证任意行驶时长下
+    遇绿。返回取到该条件的全部极大半开整数 offset 区间（按起点升序，跨
+    零点在 ``[0, C)`` 内分段）；整周期常绿时为 ``[[0, C]]``，永不可行时
+    为空。
+
+    推导（只做区间运算，不逐 offset 试探）：
+
+    1. **行驶波动收缩**：跨零点绿灯先视为连续段再按
+       :func:`eroded_green_components` 右端收缩 slack 秒；常绿直接返回整
+       个周期。
+    2. **整段时隙收缩**：令 ``L = depart_to - depart_from``。收缩绿灯分量
+       ``[a, b)`` 周期重复为 ``[kC+a, kC+b)``，连续 L 个整数出发时刻
+       ``t0..t0+L-1`` 都落在其中（最晚整数时刻 t0+L-1 加 slack 后仍须
+       严格早于右端点），当且仅当整数起点相位满足
+       ``kC+a <= t0+shift <= kC+b-L``（shift=(T+o) mod C），写成整数半开
+       区间即 ``[kC+a, kC+b-L+1)``，经周期圆旋转后给出可行 offset。余量
+       区间可能长于一个周期（跨零点绿灯收缩后 b-a 可大于 C），故周期 k 的
+       枚举同时覆盖 k=-1 与 k=1 等相邻周期。
+    """
+    slack = travel_max - travel
+    always_green, components = eroded_green_components(
+        cycle, green_start, green_end, slack
+    )
+    if always_green:
+        return [[0, cycle]]
+
+    length = depart_to - depart_from
+    raw_phase: list[Interval] = []
+    for a, b in components:
+        if b - a < length:
+            # 波动收缩后的连续绿灯分量容不下整段时隙：任何相位都无解。
+            return []
+        # r = (depart_from + T + o) mod C；r 落入 [kC+a, kC+b-L+1)（整数半开）。
+        # 枚举余量区间与 [0, C) 有非空交的周期 k：
+        #   kC + a <= C - 1   ⇔  k <= (C - 1 - a) / C
+        #   kC + b - L + 1 > 0 ⇔  k > (L - b - 1) / C
+        k_min = -((b - length + 1) // cycle)  # floor((L-b-1)/C) + 1
+        k_max = (cycle - 1 - a) // cycle
+        for k in range(k_min, k_max + 1):
+            base = k * cycle
+            raw_phase.append([base + a, base + b - length + 1])
+
+    phase_windows = clip_intervals(raw_phase, 0, cycle)
+    if not phase_windows:
+        return []
+    # o ≡ r - depart_from - T (mod C)：在周期圆上旋转 -(depart_from + T)。
+    return _rotate_intervals_on_circle(
+        merge_intervals(phase_windows),
+        cycle,
+        (depart_from + travel) % cycle,
+    )
+
+
+def _nearest_ring_offset(
+    intervals: list[Interval], original: int, cycle: int
+) -> int | None:
+    """可行区间集合中距 ``original`` 环形距离最小的整数 offset。
+
+    环形距离 ``min(|o - original|, C - |o - original|)``；等距时取较小
+    offset。可行集合以 ``[0, C)`` 内分段表示，距离沿周期圆度量，最小距离
+    只可能取在：各区间端点、``original`` 本身可行处，以及跨零点集合在圆
+    上相连时的接缝端点 0 与 C-1。收集这些候选（再按是否属于可行集合过滤）
+    逐一比较即可。
+    """
+    best: int | None = None
+    best_key: tuple[int, int] | None = None
+    candidates = {0, cycle - 1}
+    for start, end in intervals:
+        candidates.add(start)
+        candidates.add(end - 1)
+        if start <= original < end:
+            candidates.add(original)
+    for candidate in candidates:
+        if not any(start <= candidate < end for start, end in intervals):
+            continue
+        delta = abs(candidate - original)
+        distance = min(delta, cycle - delta)
+        key = (distance, candidate)
+        if best_key is None or key < best_key:
+            best_key, best = key, candidate
+    return best
+
+
+def compute_slot_offsets(
+    intersections: Iterable[dict],
+    adjustable_index: int,
+    depart_from: int,
+    depart_to: int,
+) -> tuple[list[Interval], int | None]:
+    """求可调路口保证整段逐秒可发车的全部极大半开可行 offset 区间。
+
+    ``intersections`` 参数同 :func:`compute_windows`（由 Pydantic 保证
+    合法）；``adjustable_index`` 指定唯一可调路口（从 0 起），其余路口
+    保持各自原 offset 不变。可行条件：
+
+    * 每个**固定**路口在原 offset 下的可行窗口必须完整覆盖半开发车范围
+      ``[depart_from, depart_to)``（端点均为整数，覆盖每个整数秒等价于
+      连续覆盖整段）；任一固定路口做不到，可行集即为空；
+    * **可调**路口需在其自身周期/绿灯/行驶波动下使范围内每个整数秒均可
+      发车（见 :func:`_feasible_slot_offsets_for_intersection`，跨零点绿灯
+      先连续化再波动收缩、再整段时隙收缩）。
+
+    返回 ``(可行 offset 区间列表, 建议 offset)``：区间为 ``[0, C)`` 内
+    有序、互不相交、跨零点分段表示的极大半开整数区间；建议值为距该路口
+    原 offset 环形距离最小者，等距取较小 offset；无可行值时为
+    ``([], None)``。
+    """
+    nodes = list(intersections)
+    target = nodes[adjustable_index]
+
+    for index, item in enumerate(nodes):
+        if index == adjustable_index:
+            continue
+        windows = departure_windows_for_intersection(
+            cycle=item["cycle"],
+            offset=item["offset"],
+            green_start=item["green_start"],
+            green_end=item["green_end"],
+            travel=item["travel"],
+            travel_max=item.get("travel_max"),
+            depart_from=depart_from,
+            depart_to=depart_to,
+        )
+        if windows != [[depart_from, depart_to]]:
+            return [], None
+
+    feasible = _feasible_slot_offsets_for_intersection(
+        cycle=target["cycle"],
+        green_start=target["green_start"],
+        green_end=target["green_end"],
+        travel=target["travel"],
+        travel_max=(
+            target["travel"]
+            if target.get("travel_max") is None
+            else target["travel_max"]
+        ),
+        depart_from=depart_from,
+        depart_to=depart_to,
+    )
+    if not feasible:
+        return [], None
+    suggestion = _nearest_ring_offset(
+        feasible, target["offset"], target["cycle"]
+    )
+    return feasible, suggestion

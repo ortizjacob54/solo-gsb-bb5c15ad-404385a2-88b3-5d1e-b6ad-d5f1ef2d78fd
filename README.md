@@ -2,7 +2,7 @@
 
 基于 **Python 3.11 + FastAPI** 的干线（arterial）绿波发车窗口计算服务。
 
-提供三个接口：
+提供四个接口：
 
 1. **绿波发车窗口** `POST /api/green-wave/windows`：给定干线上至多 8 个路口各自的
    信号周期、相位偏移、周期内绿灯半开区间（允许跨周期零点）以及从起点到该路口的
@@ -20,6 +20,13 @@
    观测（时间均为整数秒），对每个整数 `offset ∈ [0, cycle)` 按
    `(arrival_time + offset) mod cycle` 预测灯色，返回**最少错配条数**以及取到该值的
    **全部极大半开 offset 区间**（按起点排序；跨零点的最优集合在 `[0, cycle)` 内分段表示）。
+4. **可调路口 offset 寻优** `POST /api/green-wave/slot-offsets`：请求体复用 `/windows`
+   的路口参数与发车范围，另传 `adjustable_index`（从 0 起）指定**唯一可调路口**。服务把
+   `[depart_from, depart_to)` 内**每个整数秒**都视为必须可发车的时隙；其余路口保持各自
+   原 `offset` 不变，任一路口不能在整段范围内对 `[travel, travel_max]` 的任意实际行驶
+   时间都遇绿，则可行集为空。对可调路口返回所有可行整数 `offset ∈ [0, cycle)` 的
+   **极大半开区间**（跨零点在 `[0, cycle)` 内分段），并给出**距原 offset 环形距离最小**
+   的建议值 `suggested_offset`（环形等距时取较小 offset；无可行值时为 `null`）。
 
 ## 目录结构
 
@@ -81,6 +88,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 绿波窗口计算 | `POST http://localhost:8000/api/green-wave/windows` |
 | 最大绿波覆盖 | `POST http://localhost:8000/api/green-wave/max-coverage` |
 | 单路口 offset 诊断 | `POST http://localhost:8000/api/green-wave/offset-diagnostics` |
+| 可调路口 offset 寻优 | `POST http://localhost:8000/api/green-wave/slot-offsets` |
 | 交互式文档（Swagger UI） | `http://localhost:8000/docs` |
 | OpenAPI 描述 | `http://localhost:8000/openapi.json` |
 
@@ -458,6 +466,160 @@ curl -s -X POST http://localhost:8000/api/green-wave/offset-diagnostics \
 复杂度为 `O(n log n)`（n 为观测条数，≤ 2000），与周期 `cycle` 的大小无关；
 2000 条观测、86400 秒周期的请求在毫秒级完成。
 
+## 可调路口 offset 寻优
+
+`POST /api/green-wave/slot-offsets` 用于在干线路口红中**仅调整一个路口**的相位偏移，
+使整段发车范围的**每个整数秒**都能保证一路绿灯。请求体在 `/api/green-wave/windows`
+的全部字段（`depart_from`、`depart_to`、`intersections` 及相同的 422 校验）之外增加：
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `adjustable_index` | int | `>= 0`，唯一可调路口在 `intersections` 中的下标（从 0 起），必须小于路口数 |
+
+语义：
+
+- **固定路口**（除可调路口外的其余路口）保持各自请求中的原 `offset` 不变。其可行窗口
+  必须**完整覆盖**半开发车范围 `[depart_from, depart_to)`——窗口端点都是整数，覆盖范围
+  内每个整数秒与连续覆盖该半开区间等价。任一路口做不到（含波动量吃光绿灯的常绿以外
+  情形），整体可行集立即为空；
+- **可调路口**的 `offset` 允许取任意整数 `o ∈ [0, C)`（C 为该路口周期）。要求范围
+  `[depart_from, depart_to)` 内**每个整数出发秒**在实际行驶时间取
+  `[travel, travel_max]` 内任意实数时抵达该路口都遇绿灯。
+
+响应：
+
+- `adjustable_index`：回显请求中的可调路口下标；
+- `feasible_intervals`：所有可行整数 offset 的**极大半开区间** `[start, end)`
+  （整数 offset 满足 `start <= offset < end`，`0 <= start < end <= cycle`），按起点
+  升序；跨零点的可行集合在 `[0, cycle)` 内**分段**表示，不出现跨周期的单一区间；
+  无可行值时为 `[]`；
+- `suggested_offset`：距该路口**原 offset 环形距离**
+  `min(|o-o₀|, C-|o-o₀|)` 最小的可行整数 offset；环形等距时取**较小** offset；
+  无可行值时为 `null`。
+
+```json
+{
+  "adjustable_index": 1,
+  "feasible_intervals": [{"start": 20, "end": 31}],
+  "suggested_offset": 25
+}
+```
+
+### 示例 1：基本寻优（波动收缩 + 整段时隙收缩）
+
+固定路口 1 整周期常绿；可调路口 2 周期 60、绿灯本地相位 `[20,40)`、行驶 0、原
+offset 为 25。要求发车范围 `[0,10)` 内 10 个整数秒（0～9）全部遇绿：整段 10 秒必须
+落入 20 秒绿灯内，起点相位允许在 `[20, 40-10+1) = [20,31)`（最晚整数秒 9 的到达相位
+严格小于 40），故可行 offset 为 `[20,31)`；原 offset 25 本身可行，建议值即 25：
+
+```bash
+curl -s -X POST http://localhost:8000/api/green-wave/slot-offsets \
+  -H "Content-Type: application/json" \
+  -d '{
+    "depart_from": 0,
+    "depart_to": 10,
+    "adjustable_index": 1,
+    "intersections": [
+      {"cycle": 60, "offset": 25, "green_start": 0,  "green_end": 0,  "travel": 0},
+      {"cycle": 60, "offset": 25, "green_start": 20, "green_end": 40, "travel": 0}
+    ]
+  }'
+```
+
+响应：
+
+```json
+{"adjustable_index":1,"feasible_intervals":[{"start":20,"end":31}],"suggested_offset":25}
+```
+
+### 示例 2：跨零点绿灯与跨零点可行集
+
+可调路口绿灯跨零点 `[50,60) ∪ [0,10)`（先视作连续时段 `[50,70)`，长 20 秒），行驶
+0，发车范围 `[52,57)`（5 个整数秒）。连续弧起点相位允许在 `[50, 70-5+1) = [50,66)`，
+绕零点；按 `o ≡ r - depart_from (mod 60)` 旋转回 offset 后，可行集合在 `[0,60)` 内
+断为两段 `[0,14)` 与 `[58,60)`；原 offset 3 本身可行，建议值为 3：
+
+```bash
+curl -s -X POST http://localhost:8000/api/green-wave/slot-offsets \
+  -H "Content-Type: application/json" \
+  -d '{
+    "depart_from": 52,
+    "depart_to": 57,
+    "adjustable_index": 0,
+    "intersections": [
+      {"cycle": 60, "offset": 3, "green_start": 50, "green_end": 10, "travel": 0}
+    ]
+  }'
+# {"adjustable_index":0,
+#  "feasible_intervals":[{"start":0,"end":14},{"start":58,"end":60}],
+#  "suggested_offset":3}
+```
+
+### 示例 3：行驶波动与整段时隙共同收缩
+
+绿灯 `[20,60)` 长 40 秒，实际行驶时间可能取 `[0,10]` 任意实数（slack=10），发车范围
+长 20 秒 `[0,20)`：绿灯先按波动收缩为 `[20,50)`，再按整段时隙收缩为起点相位
+`[20, 50-20+1) = [20,31)`，可行 offset 恰为这 11 个整数：
+
+```bash
+curl -s -X POST http://localhost:8000/api/green-wave/slot-offsets \
+  -H "Content-Type: application/json" \
+  -d '{
+    "depart_from": 0,
+    "depart_to": 20,
+    "adjustable_index": 0,
+    "intersections": [
+      {"cycle": 60, "offset": 0, "green_start": 20, "green_end": 0,
+       "travel": 0, "travel_max": 10}
+    ]
+  }'
+# {"adjustable_index":0,"feasible_intervals":[{"start":20,"end":31}],"suggested_offset":20}
+```
+
+跨零点绿灯在波动收缩时**先视为一条连续时段**（如 `[50,60) ∪ [0,10)` 长 20 秒、行驶
+`[0,10]` 收缩后为 `[50,60)` 长 10 秒），再做整段时隙收缩；若错误地拆成两段分别收缩
+会得到本应存在的可行 offset 全部丢失。整周期常绿（`green_start == green_end`）不受
+行驶波动影响；若波动收缩或时隙收缩后余量为空（绿灯连续长度 `< slack + L`，L 为范围
+长度），可行集为空。
+
+### 示例 4：固定路口无法整段保证遇绿
+
+固定路口绿灯仅 `[0,30)`，发车范围 `[0,60)` 中 30 秒以后为红灯，无论可调路口如何取值
+都无法让整段每个整数秒可发车，返回空可行集与 `null` 建议值：
+
+```bash
+curl -s -X POST http://localhost:8000/api/green-wave/slot-offsets \
+  -H "Content-Type: application/json" \
+  -d '{
+    "depart_from": 0,
+    "depart_to": 60,
+    "adjustable_index": 1,
+    "intersections": [
+      {"cycle": 60, "offset": 0, "green_start": 0,  "green_end": 30, "travel": 0},
+      {"cycle": 60, "offset": 0, "green_start": 0,  "green_end": 0,  "travel": 0}
+    ]
+  }'
+# {"adjustable_index":1,"feasible_intervals":[],"suggested_offset":null}
+```
+
+### slot-offsets 的算法说明（两次收缩 + 周期圆旋转，不逐 offset 试探）
+
+1. **固定路口整段判定**：直接复用与 `/windows` 相同的单路口可行窗口计算
+   （跨零点绿灯先连续化再波动收缩、常绿不收缩、半开边界裁剪、相邻窗口合并），结果恰为
+   `[depart_from, depart_to)` 才视为整段可行；
+2. **可调路口两次收缩**：先按行驶波动量 `slack = T_max - T` 把连续绿灯分量右端收缩
+   （跨零点先视为连续段 `[g_start, C+g_end)` 再收缩，分量可长于一个周期）；再令范围
+   长度 `L = depart_to - depart_from` 做整段时隙收缩——连续 L 个整数出发时刻
+   `t0..t0+L-1` 全部落入周期重复分量 `[kC+a, kC+b)`，当且仅当起点相位
+   `r = (depart_from + T + o) mod C` 落在整数半开余量区间
+   `[kC+a, kC+b-L+1)` 内；
+3. **周期圆旋转**：余量区间裁剪进 `[0, C)` 并合并后，按
+   `o ≡ r - depart_from - T (mod C)` 在周期圆上旋转（绕零点断成两段），即得全部极大
+   半开可行 offset 区间。全程仅枚举与 `[0, C)` 相交的常数个周期 k，不逐 offset 试探；
+4. **建议值**：环形距离只可能在各可行弧端点、原 offset 本身及跨零点接缝处取最小，
+   收集候选后按 `(环形距离, offset)` 取字典序最小，即实现"环形距离最小、等距取较小
+   offset"；无可行值时为 `null`。
+
 ## 输入校验与错误
 
 无效周期、相位偏移、绿灯端点、行驶时间（含 `travel_max < travel` 或
@@ -476,6 +638,14 @@ curl -s -X POST http://localhost:8000/api/green-wave/offset-diagnostics \
 - `green_start` / `green_end` 不满足 `0 <= g < cycle`（端点相等表示常绿，合法）；
 - `observations` 数量不在 `1..2000`；
 - 字段缺失或类型错误（如 `observed_green` 不是布尔值）。
+
+`/api/green-wave/slot-offsets` **沿用绿波接口的全部 422 校验**（路口周期/偏移/绿灯
+端点/行驶时间、`travel_max` 约束、路口数 1..8、发车范围长度 1..3600 秒、字段类型），
+并在 `adjustable_index` 为负数或不小于路口数时返回 422：
+
+```json
+{ "detail": ["adjustable_index 必须满足 0 <= adjustable_index < 路口数"] }
+```
 
 例如绿灯终点越界：
 
@@ -504,6 +674,11 @@ curl -s -X POST http://localhost:8000/api/green-wave/offset-diagnostics \
 `/api/green-wave/max-coverage` 复用第 1、2 步得到的各路口可行窗口，再在窗口端点
 放置差分事件做一次扫描（至多 `8 × 2 × 3600` 个事件），复杂度与窗口接口同阶。
 
+`/api/green-wave/slot-offsets` 对每个固定路口复用第 1、2 步的整段判定；对可调路口
+在第 1 步波动收缩后再做一次整段时隙收缩（绿灯余量区间），只枚举与 `[0, C)` 相交的
+常数个周期 k 并在周期圆上旋转一次，复杂度与路口数和范围长度无关地仅为常数次区间
+运算（与 C 大小无关），86400 秒周期、3600 秒范围的请求在毫秒级完成。
+
 ## 运行测试
 
 ```bash
@@ -516,4 +691,7 @@ pytest -q
 400 组随机参数下与逐秒统计覆盖数参考实现的对照（含相邻最优段合并与最大值为 0
 时返回完整范围）；offset 诊断
 另有 2000+ 组随机参数下与逐 offset 暴力实现的对照、跨零点分段、常绿灯、
-负到达时刻、周期 1 秒及 2000 条观测的性能用例。
+负到达时刻、周期 1 秒及 2000 条观测的性能用例；slot-offsets 另有 2400+ 组随机
+参数（1..8 路口、跨零点绿灯、行驶波动、范围跨多个周期、周期 1 秒）下与逐
+offset × 逐整数秒暴力实现的对照，以及环形距离建议值（含跨零点接缝与等距取小）
+对 5000 组随机可行集合的对照。

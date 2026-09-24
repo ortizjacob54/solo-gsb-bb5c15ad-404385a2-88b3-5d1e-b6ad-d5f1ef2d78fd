@@ -5,12 +5,14 @@ from pydantic import ValidationError
 from app.main import (
     green_wave_max_coverage,
     green_wave_offset_diagnostics,
+    green_wave_slot_offsets,
     green_wave_windows,
 )
 from app.schemas import (
     GreenWaveRequest,
     Intersection,
     OffsetDiagnosticsRequest,
+    SlotOffsetRequest,
 )
 
 
@@ -431,3 +433,145 @@ def test_offset_diagnostics_route_is_in_openapi():
     paths = app.openapi()["paths"]
     assert "/api/green-wave/offset-diagnostics" in paths
     assert "post" in paths["/api/green-wave/offset-diagnostics"]
+
+
+# ---------- POST /api/green-wave/slot-offsets ----------
+
+def make_slot_request(payload):
+    return SlotOffsetRequest.model_validate(payload)
+
+
+def test_slot_offsets_payload_basic():
+    req = make_slot_request(
+        {
+            "depart_from": 0,
+            "depart_to": 10,
+            "adjustable_index": 1,
+            "intersections": [
+                {"cycle": 60, "offset": 0, "green_start": 0,
+                 "green_end": 0, "travel": 0},  # 固定常绿
+                {"cycle": 60, "offset": 25, "green_start": 20,
+                 "green_end": 40, "travel": 0},  # 可调
+            ],
+        }
+    )
+    resp = green_wave_slot_offsets(req)
+    assert resp.adjustable_index == 1
+    assert [[w.start, w.end] for w in resp.feasible_intervals] == [[20, 31]]
+    assert resp.suggested_offset == 25
+
+
+def test_slot_offsets_wrapping_intervals():
+    req = make_slot_request(
+        {
+            "depart_from": 52,
+            "depart_to": 57,
+            "adjustable_index": 0,
+            "intersections": [
+                {"cycle": 60, "offset": 3, "green_start": 50,
+                 "green_end": 10, "travel": 0},
+            ],
+        }
+    )
+    resp = green_wave_slot_offsets(req)
+    assert [[w.start, w.end] for w in resp.feasible_intervals] == [
+        [0, 14], [58, 60],
+    ]
+    # 原 offset=3 本身就在可行区间 [0,14) 内
+    assert resp.suggested_offset == 3
+
+
+def test_slot_offsets_empty_gives_null_suggestion():
+    req = make_slot_request(
+        {
+            "depart_from": 0,
+            "depart_to": 60,
+            "adjustable_index": 1,
+            "intersections": [
+                # 固定路口绿灯只有 [0,30)，无法整段覆盖 [0,60)
+                {"cycle": 60, "offset": 0, "green_start": 0,
+                 "green_end": 30, "travel": 0},
+                {"cycle": 60, "offset": 0, "green_start": 0,
+                 "green_end": 0, "travel": 0},
+            ],
+        }
+    )
+    resp = green_wave_slot_offsets(req)
+    assert resp.feasible_intervals == []
+    assert resp.suggested_offset is None
+
+
+def test_slot_offsets_rejects_index_out_of_range():
+    req = make_slot_request(
+        {
+            "depart_from": 0,
+            "depart_to": 60,
+            "adjustable_index": 2,
+            "intersections": [
+                {"cycle": 60, "offset": 0, "green_start": 0,
+                 "green_end": 30, "travel": 0},
+                {"cycle": 60, "offset": 0, "green_start": 0,
+                 "green_end": 30, "travel": 0},
+            ],
+        }
+    )
+    with pytest.raises(HTTPException) as exc:
+        green_wave_slot_offsets(req)
+    assert exc.value.status_code == 422
+
+
+def test_slot_offsets_rejects_negative_index():
+    with pytest.raises(ValidationError):
+        make_slot_request(
+            {
+                "depart_from": 0,
+                "depart_to": 60,
+                "adjustable_index": -1,
+                "intersections": [
+                    {"cycle": 60, "offset": 0, "green_start": 0,
+                     "green_end": 30, "travel": 0},
+                ],
+            }
+        )
+
+
+def test_slot_offsets_reuses_422_validation():
+    # 沿用既有路口与发车范围校验：offset 越界仍是 422
+    req = make_slot_request(
+        {
+            "depart_from": 0,
+            "depart_to": 60,
+            "adjustable_index": 0,
+            "intersections": [
+                {"cycle": 60, "offset": 60, "green_start": 0,
+                 "green_end": 30, "travel": 0},
+            ],
+        }
+    )
+    with pytest.raises(HTTPException) as exc:
+        green_wave_slot_offsets(req)
+    assert exc.value.status_code == 422
+
+    # 发车范围超过 3600 秒仍是 422
+    req2 = make_slot_request(
+        {
+            "depart_from": 0,
+            "depart_to": 3601,
+            "adjustable_index": 0,
+            "intersections": [
+                {"cycle": 60, "offset": 0, "green_start": 0,
+                 "green_end": 30, "travel": 0},
+            ],
+        }
+    )
+    with pytest.raises(HTTPException) as exc:
+        green_wave_slot_offsets(req2)
+    assert exc.value.status_code == 422
+
+
+def test_slot_offsets_route_is_in_openapi():
+    from app.main import app
+
+    paths = app.openapi()["paths"]
+    assert "/api/green-wave/slot-offsets" in paths
+    assert "post" in paths["/api/green-wave/slot-offsets"]
